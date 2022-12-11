@@ -1,0 +1,303 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torchvision import datasets, transforms
+from torch.autograd import Variable
+import matplotlib.pyplot as plt
+import numpy as np
+
+
+class BN2dFitlered(nn.Module):
+            def __init__(self, Channels, Thres=2.0  ):
+                super(BN2dFitlered , self).__init__()
+                self.ChannelNum=Channels
+                self.beta=nn.Parameter(torch.tensor([0.0]*int(Channels)).reshape(1,Channels,1,1), requires_grad=True)
+                self.gamma=nn.Parameter(torch.tensor([1.0]*int(Channels)).reshape(1,Channels,1,1), requires_grad=True)
+                self.Thres=Thres
+                
+            def forward(self, xorig):
+                x=xorig.permute([1,0,2,3])
+                x=x.reshape((self.ChannelNum,-1))
+                
+                Mean=torch.mean(x, dim=-1).reshape((self.ChannelNum,1))
+                Var=torch.var(x, dim=-1).reshape((self.ChannelNum,1))
+                Mean=Mean.expand((self.ChannelNum,x.shape[1]))
+                Var=Var.expand((self.ChannelNum,x.shape[1]))
+                
+                eps=1e-10
+                normalized= (x-Mean)/torch.sqrt(Var+eps)
+                
+                Selected= ((normalized<self.Thres) * (normalized>-self.Thres)).float()
+                #masked mean
+                Mean=torch.sum(x*Selected, dim=[-1])/torch.sum(Selected,dim=[-1])
+                
+                Diff=(x - Mean.reshape((self.ChannelNum,1)).expand(self.ChannelNum,x.shape[1])  )**2
+                
+                Mean=Mean.reshape((1,self.ChannelNum,1,1))
+                Mean=Mean.expand((xorig.shape[0],self.ChannelNum,xorig.shape[2],xorig.shape[3]))
+                
+                
+                Var= torch.sum(Diff*Selected , dim=[-1])/torch.sum(Selected,dim=[-1])
+                Var=Var.reshape((1,self.ChannelNum,1,1))
+                Var=Var.expand((xorig.shape[0],self.ChannelNum,xorig.shape[2],xorig.shape[3]))
+                
+                eps=1e-10
+                beta=self.beta.expand((xorig.shape[0],self.ChannelNum,xorig.shape[2],xorig.shape[3]))
+                gamma=self.gamma.expand((xorig.shape[0],self.ChannelNum,xorig.shape[2],xorig.shape[3]))
+                
+                bnfiltered= ((gamma*(xorig-Mean))/torch.sqrt(Var+eps)      )+beta
+                return bnfiltered
+
+class BN1dFitlered(nn.Module):
+    def __init__(self,Thres=4.0):
+        super(BN1dFitlered , self).__init__()
+        self.Thres=Thres
+        self.beta=nn.Parameter(torch.tensor(0.0), requires_grad=True)
+        self.gamma=nn.Parameter(torch.tensor(1.0), requires_grad=True)
+
+    def SetThreshold(Thres):
+        self.Thres=Thres      
+    def forward(self, xorig):
+        x=xorig.view(-1)
+        Mean=torch.mean(x)
+        Var=torch.var(x)
+        eps=1e-10
+        normalized= (x-Mean)/torch.sqrt(Var+eps)
+        Selected=(normalized<self.Thres) * (normalized>-self.Thres)
+        prunedx=x[Selected]
+        
+        Mean=torch.mean(prunedx)
+        Var=torch.var(prunedx)
+        eps=1e-10
+        bn= (self.gamma*(xorig-Mean)/torch.sqrt(Var+eps))+self.beta
+        return bn
+
+class BN1dFitleredMoments(nn.Module):
+    def __init__(self,Thres=4.0):
+        super(BN1dFitleredMoments , self).__init__()
+        self.Thres=Thres
+        self.beta=nn.Parameter(torch.tensor(0.0), requires_grad=True)
+        self.gamma=nn.Parameter(torch.tensor(1.0), requires_grad=True)
+        self.alpha=0.9
+        self.Mean=0.0
+        self.Var=1.0
+
+    def SetThreshold(Thres):
+        self.Thres=Thres      
+    def forward(self, xorig):
+        x=xorig.view(-1)
+        Mean=torch.mean(x)
+        Var=torch.var(x)
+        eps=1e-10
+        normalized= (x-Mean)/torch.sqrt(Var+eps)
+        Selected=(normalized<self.Thres) * (normalized>-self.Thres)
+        prunedx=x[Selected]
+        
+        Mean=torch.mean(prunedx)
+        Var=torch.var(prunedx)
+        self.Mean=self.alpha*self.Mean+(1.0-self.alpha)*Mean
+        self.Var=self.alpha*self.Var+(1.0-self.alpha)*Var
+        eps=1e-10
+        bn= (self.gamma*(xorig-self.Mean)/torch.sqrt(self.Var+eps))+self.beta
+        return bn
+        
+                
+class BN1dRef(nn.Module):
+    def __init__(self):
+        super(BN1dRef , self).__init__()
+        self.beta=nn.Parameter(torch.tensor(0.0), requires_grad=True)
+        self.gamma=nn.Parameter(torch.tensor(1.0), requires_grad=True)
+        
+    def forward(self, xorig):
+        x=xorig.view(-1)
+        Mean=torch.mean(x)
+        Var=torch.var(x)
+        eps=1e-10
+        bn= (self.gamma*(xorig-Mean)/torch.sqrt(Var+eps))+self.beta
+        return bn
+        
+
+def RunTest(BNType,Epoch,Repeat, BatchSize, FilterValue=4.0):
+        # download and transform train dataset
+        train_loader = torch.utils.data.DataLoader(datasets.MNIST('../../mnist_data', download=True, train=True, transform=transforms.Compose([
+        transforms.ToTensor(), # first, convert image to PyTorch tensor
+        transforms.Normalize((0.1307,), (0.3081,)) ])), 
+        batch_size=BatchSize, shuffle=True)
+
+        # download and transform test dataset
+        test_loader = torch.utils.data.DataLoader(datasets.MNIST('../../mnist_data', download=True, train=False,transform=transforms.Compose([
+        transforms.ToTensor(), # first, convert image to PyTorch tensor
+        transforms.Normalize((0.1307,), (0.3081,)) ])), 
+         batch_size=BatchSize, shuffle=True)
+         
+        if BNType=="Builtin":
+                BNFunction=nn.BatchNorm1d   
+        elif BNType=="Filtered": 
+                BNFunction=BN1dFitlered
+        elif BNType=="FilteredMoments": 
+                BNFunction=BN1dFitleredMoments
+        elif BNType=="Ref": 
+                BNFunction=BN1dRef
+        elif BNType=="None": 
+                BNFunction=None
+   
+
+        
+        class CNNClassifier(nn.Module):
+            def __init__(self):
+                super(CNNClassifier, self).__init__()
+                self.conv1 = nn.Conv2d(1, 6, kernel_size=5, padding=2)
+                self.conv2 = nn.Conv2d(6, 16, kernel_size=5)
+                self.fc1 = nn.Linear(16*5*5, 120)
+                self.fc2 = nn.Linear(120, 84)
+                self.fc3 = nn.Linear(84, 10)
+                
+                if BNType=="Filtered": 
+                        self.bn1 = BN2dFitlered(6,FilterValue)
+                        self.bn2 = BN2dFitlered(16,FilterValue)
+                        self.bn3 = BN1dFitlered(FilterValue)
+                        self.bn4 = BN1dFitlered(FilterValue)
+                else:
+                        self.bn1 = nn.BatchNorm2d(6)
+                        self.bn2 = nn.BatchNorm2d(16)
+                        self.bn3 = nn.BatchNorm1d(120)
+                        self.bn4 = nn.BatchNorm1d(84)
+ 
+           
+            def forward(self, x):
+                x=self.conv1(x)
+                if BNType=="None":
+                       pass
+                else:
+                        x =self.bn1(x) 
+                x=F.max_pool2d(x, 2 ,2)
+                x = F.relu(x)
+                
+                x=self.conv2(x)
+                if BNType=="None":
+                       pass
+                else:
+                        x =self.bn2(x) 
+                x=F.max_pool2d(x, 2 ,2)
+                x = F.relu(x)
+                
+                x= x.view(-1,16*5*5)
+                
+                x=self.fc1(x)
+                if BNType=="None":
+                       pass
+                else:
+                        x =self.bn3(x) 
+                x = F.relu(x)
+                
+                x=self.fc2(x)
+                if BNType=="None":
+                       pass
+                else:
+                        x =self.bn4(x) 
+                x = F.relu(x)
+                
+                x=self.fc3(x)
+                
+                
+                return F.log_softmax(x)
+
+        # create classifier and optimizer objects
+
+        train_loss_history = []
+        train_acc_history = []
+        test_loss_history = []
+        test_acc_history = []
+
+        def train(epoch):
+            
+            for batch_id, (data, label) in enumerate(train_loader):
+                clf.train()
+                data=data.cuda()
+                label=label.cuda()
+                opt.zero_grad()
+                preds = clf(data)
+                loss = F.nll_loss(preds, label)
+                loss.backward(retain_graph=True)
+                train_loss_history[-1].append(loss.item())
+                opt.step()
+                predind = preds.data.max(1)[1] 
+                acc = predind.eq(label.data).cpu().float().mean() 
+                train_acc_history[-1].append(acc)
+                
+                if batch_id % 100 == 0:
+                    print("Train Loss: "+str(loss.item())+" Acc: "+str(acc.item()))
+
+                    #run independent test
+                    clf.eval() # set model in inference mode (need this because of dropout)
+                    test_loss = 0
+                    correct = 0
+                
+                    for data, target in test_loader: 
+                        data=data.cuda()
+                        target=target.cuda()  
+                        with torch.no_grad():    
+                           output = clf(data)
+                           test_loss += F.nll_loss(output, target).item()
+                           pred = output.data.max(1)[1] 
+                           correct += pred.eq(target.data).cpu().sum()
+
+                    test_loss = test_loss
+                    test_loss /= len(test_loader) # loss function already averages over batch size
+                    accuracy =  correct.item() / len(test_loader.dataset)
+                    #print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
+                    #    test_loss, correct, len(test_loader.dataset),
+                    #    accuracy))
+                    test_acc_history[-1].append(accuracy)
+                    test_loss_history[-1].append(test_loss)
+                    print("Test Loss: "+str(test_loss)+" Acc: "+str(accuracy))
+
+
+        for repeat in range(0, Repeat):
+            print("repeat: "+str(repeat))
+            clf = CNNClassifier()
+            clf.cuda()
+            #opt = optim.Adam(clf.parameters(), lr=0.01)
+            opt = optim.SGD(clf.parameters(), lr=0.01, momentum=0.5)
+            train_loss_history.append([])
+            train_acc_history.append([])
+            test_loss_history.append([])
+            test_acc_history.append([])
+            for epoch in range(0, Epoch):
+                print("Epoch %d" % epoch)
+                train(epoch)
+            torch.cuda.empty_cache()
+        if BNType=="Filtered" or BNType=="FilteredMoments": 
+                np.save("res5/"+BNType+"_"+str(BatchSize)+"_"+str(FilterValue)+"_train_loss.npy",np.array(train_loss_history))
+                np.save("res5/"+BNType+"_"+str(BatchSize)+"_"+str(FilterValue)+"_train_acc.npy",np.array(train_acc_history))
+                np.save("res5/"+BNType+"_"+str(BatchSize)+"_"+str(FilterValue)+"_test_loss.npy",np.array(test_loss_history))
+                np.save("res5/"+BNType+"_"+str(BatchSize)+"_"+str(FilterValue)+"_test_acc.npy",np.array(test_acc_history))
+
+        else: 
+                np.save("res5/"+BNType+"_"+str(BatchSize)+"_train_loss.npy",np.array(train_loss_history))
+                np.save("res5/"+BNType+"_"+str(BatchSize)+"_train_acc.npy",np.array(train_acc_history))
+                np.save("res5/"+BNType+"_"+str(BatchSize)+"_test_loss.npy",np.array(test_loss_history))
+                np.save("res5/"+BNType+"_"+str(BatchSize)+"_test_acc.npy",np.array(test_acc_history))
+
+Epoch=3
+Repeat=10
+BatchSize=256
+print("Test Builtin")
+#RunTest("Builtin",Epoch,Repeat,BatchSize)
+print("Test Filtered")
+RunTest("Filtered",Epoch,Repeat,BatchSize,2.0)
+RunTest("Filtered",Epoch,Repeat,BatchSize,3.0)
+RunTest("Filtered",Epoch,Repeat,BatchSize,4.0)
+RunTest("Filtered",Epoch,Repeat,BatchSize,5.0)
+
+#print("Test Ref")
+#RunTest("Ref",Epoch,Repeat,BatchSize)
+print("Test None")
+RunTest("None",Epoch,Repeat,BatchSize)
+
+
+
+
+
+
